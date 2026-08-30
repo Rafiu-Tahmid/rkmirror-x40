@@ -6,6 +6,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # GitHub removed Node 20 from hosted runners in 2026. All actions below are
+  # Node-24-capable, and this also makes the runtime choice explicit.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   build:
     name: Profile ${{ matrix.profile }}
@@ -18,41 +23,120 @@ jobs:
 
     steps:
       - name: Checkout this kit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Free runner disk space
+      - name: Free non-Android runner disk space
         shell: bash
         run: |
           set -euxo pipefail
           df -h
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
-          sudo rm -rf /usr/local/lib/android/sdk/system-images || true
+          # Do NOT remove anything under the Android SDK. The previous workflow
+          # depended on the hosted runner's SDK, so keep it intact.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/powershell || true
           df -h
 
       - name: Set up Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - name: Set up Go 1.25.10
+        uses: actions/setup-go@v7
         with:
           go-version: '1.25.10'
           cache: false
 
-      - name: Install Android SDK pieces
+      - name: Locate and verify Android SDK
         shell: bash
         run: |
           set -euxo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager \
-            'platform-tools' \
-            'platforms;android-36' \
-            'build-tools;36.0.0' \
-            'ndk;27.0.12077973'
-          test -d "$ANDROID_SDK_ROOT/ndk/27.0.12077973"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+          # ubuntu-latest normally exports both variables, but do not assume a
+          # bare `sdkmanager` command is on PATH. That was the exact cause of
+          # the previous exit-code-127 failure.
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
+            for candidate in /usr/local/lib/android/sdk "$HOME/Android/Sdk"; do
+              if [ -d "$candidate" ]; then
+                SDK_ROOT="$candidate"
+                break
+              fi
+            done
+          fi
+          test -n "$SDK_ROOT"
+          test -d "$SDK_ROOT"
+
+          export ANDROID_HOME="$SDK_ROOT"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          echo "Android SDK root: $SDK_ROOT"
+          echo "Java: $(java -version 2>&1 | head -n 1)"
+          echo "Go: $(go version)"
+          command -v git
+          command -v python3
+          command -v bash
+          command -v realpath
+          command -v sed
+          command -v sha256sum
+
+          NDK_VERSION='27.0.12077973'
+          NEED_INSTALL=0
+          [ -d "$SDK_ROOT/platforms/android-36" ] || NEED_INSTALL=1
+          [ -d "$SDK_ROOT/build-tools/36.0.0" ] || NEED_INSTALL=1
+          [ -d "$SDK_ROOT/ndk/$NDK_VERSION" ] || NEED_INSTALL=1
+
+          if [ "$NEED_INSTALL" -eq 1 ]; then
+            SDKMANAGER=''
+
+            # Prefer the canonical stable location documented by Android.
+            if [ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+              SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+            else
+              # GitHub images can carry a versioned cmdline-tools directory
+              # without a `latest` alias. Find the newest installed copy.
+              SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' -perm -111 2>/dev/null | sort -V | tail -n 1 || true)"
+            fi
+
+            if [ -n "$SDKMANAGER" ] && [ -x "$SDKMANAGER" ]; then
+              echo "Using sdkmanager: $SDKMANAGER"
+              set +o pipefail
+              yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true
+              set -o pipefail
+              "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
+                'platform-tools' \
+                'platforms;android-36' \
+                'build-tools;36.0.0' \
+                "ndk;$NDK_VERSION"
+            elif command -v android >/dev/null 2>&1; then
+              # Android CLI became the primary terminal interface in 2026.
+              # This fallback is only used if the legacy sdkmanager executable
+              # is genuinely absent.
+              echo "sdkmanager not found; using Android CLI fallback"
+              android --sdk="$SDK_ROOT" sdk install \
+                platforms/android-36 \
+                build-tools/36.0.0
+              # Most hosted images already contain the exact NDK. If not,
+              # print the package listing before failing rather than returning
+              # a misleading command-not-found error.
+              if [ ! -d "$SDK_ROOT/ndk/$NDK_VERSION" ]; then
+                android --sdk="$SDK_ROOT" sdk list 'ndk' --all-versions || true
+              fi
+            else
+              echo 'Neither sdkmanager nor the new Android CLI was found.' >&2
+              find "$SDK_ROOT/cmdline-tools" -maxdepth 4 -type f 2>/dev/null | sort | tail -n 100 || true
+            fi
+          fi
+
+          # Hard gates: never move on to a 10+ minute build with a half-ready SDK.
+          test -d "$SDK_ROOT/platforms/android-36"
+          test -d "$SDK_ROOT/build-tools/36.0.0"
+          test -d "$SDK_ROOT/ndk/$NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "Android SDK/NDK verification passed."
+          df -h
 
       - name: Clone exact upstream release
         shell: bash
@@ -61,7 +145,8 @@ jobs:
           git clone --branch v0.0.33 --depth 1 --recurse-submodules \
             https://github.com/jqssun/android-display-mirror.git src
           cd src
-          test "$(git rev-parse HEAD)" = "6836ad7efe3e27b8db76422fdbc9b81b4973c16a"
+          test "$(git rev-parse HEAD)" = '6836ad7efe3e27b8db76422fdbc9b81b4973c16a'
+          test "$(git -C doubletake/doubletake rev-parse HEAD)" = '568a06ed32afa9fafdf229a798db0786f4d020f2'
           git submodule status --recursive
 
       - name: Apply RK-X40 compatibility profile
@@ -69,17 +154,33 @@ jobs:
         run: |
           set -euxo pipefail
           python3 apply_patch.py --repo src --profile '${{ matrix.profile }}'
-          grep -R "SetupMirrorRKX40" -n src/doubletake | head
-          grep -R "RKX40" -n src/doubletake/airplaylib/airplaylib.go | head
+          grep -R 'SetupMirrorRKX40' -n src/doubletake | head
+          grep -R 'RKX40' -n src/doubletake/airplaylib/airplaylib.go | head
+          python3 -m py_compile apply_patch.py
+
+      - name: Preflight patched sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd src
+          test -x ./build.sh
+          test -x ./gradlew
+          grep -q 'rkx40.go' build.sh
+          grep -q 'SetupMirrorRKX40' doubletake/airplaylib/airplaylib.go
+          test -s doubletake/rkx40.go
+          # The upstream build script installs gomobile/gobind itself and adds
+          # GOPATH/bin to PATH. Show the relevant lines so a future failure is
+          # diagnosable directly from the Actions log.
+          grep -nE 'go install|GOPATH|gomobile bind|ANDROID_NDK' build.sh
 
       - name: Build AirPlay library
         working-directory: src
         shell: bash
         run: |
           set -euxo pipefail
-          chmod +x build.sh gradlew
           ./build.sh
           test -s app/libs/airplaylib.aar
+          ls -lh app/libs/airplaylib.aar
 
       - name: Build Android APK
         working-directory: src
@@ -87,12 +188,14 @@ jobs:
         run: |
           set -euxo pipefail
           ./gradlew --no-daemon assembleDebug --stacktrace
-          test -s app/build/outputs/apk/debug/app-debug.apk
-          cp app/build/outputs/apk/debug/app-debug.apk "../RK-Mirror-X40-P${{ matrix.profile }}-debug.apk"
+          APK='app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$APK"
+          cp "$APK" "../RK-Mirror-X40-P${{ matrix.profile }}-debug.apk"
           sha256sum "../RK-Mirror-X40-P${{ matrix.profile }}-debug.apk" > "../RK-Mirror-X40-P${{ matrix.profile }}-debug.apk.sha256"
+          ls -lh "../RK-Mirror-X40-P${{ matrix.profile }}-debug.apk"
 
-      - name: Upload APK + checksum
-        uses: actions/upload-artifact@v4
+      - name: Upload APK and checksum
+        uses: actions/upload-artifact@v6
         with:
           name: RK-Mirror-X40-P${{ matrix.profile }}
           path: |
@@ -103,7 +206,7 @@ jobs:
 
       - name: Upload failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: diagnostics-P${{ matrix.profile }}
           path: |

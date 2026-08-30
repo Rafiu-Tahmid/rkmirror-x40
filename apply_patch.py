@@ -34,6 +34,14 @@ replace_required(
     'ln -sf ../../../airplay1.go internal/airplay/airplay1.go\nln -sf ../../../rkx40.go internal/airplay/rkx40.go',
     'build.sh RK source link')
 
+# The cloud workflow verifies/installs the exact NDK before build.sh runs. Avoid
+# asking sdkmanager to install the same NDK a second time on every profile.
+replace_required(
+    build,
+    'if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then\n"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${ANDROID_NDK_VERSION}"\nfi',
+    'if [ ! -d "$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" ] && [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then\n"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${ANDROID_NDK_VERSION}"\nfi',
+    'build.sh idempotent NDK install')
+
 ap = root / 'doubletake' / 'airplaylib' / 'airplaylib.go'
 replace_required(
     ap,
