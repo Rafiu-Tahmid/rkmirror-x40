@@ -1,27 +1,24 @@
-# RK Mirror X40 — Cloud Build Kit v1.3
+# RK Mirror X40 Cloud Builder v1.4
 
-This kit updates the existing GitHub repository and builds the three RK-X40 compatibility APK profiles entirely on GitHub Actions. The Windows updater requires only Git (already installed). It does not require Python, Android Studio, an Android SDK/NDK, Gradle, Java, or Go locally for compilation.
+This version is designed so you only run one Windows file.
 
-## Existing repository (recommended)
+## Run
 
-1. Extract this ZIP.
-2. Double-click `UPDATE-EXISTING-REPO.bat`.
-3. Press Enter to use the default repository `https://github.com/Rafiu-Tahmid/rkmirror-x40.git`.
-4. Wait for `SUCCESS`.
-5. In GitHub, open **Actions → Build RK Mirror APKs → Run workflow → Run workflow**.
+Double-click **UPDATE-AND-BUILD.bat** and press Enter at the repository prompt.
+It updates the existing `Rafiu-Tahmid/rkmirror-x40` repository, pushes one commit, and the push automatically starts GitHub Actions.
 
-## What v1.3 fixes
+No Android Studio, Android SDK, NDK, Gradle, Go build, or APK compilation happens on your PC.
 
-The v1.2 patcher tried to rename an Android string resource named `mirror_app_name`. The pinned upstream v0.0.33 source does not define that resource, so the patch step could exit before compilation. v1.3 removes all cosmetic app-name/version edits and patches only the three behavior-critical points: add `rkx40.go`, link it into the nested AirPlay build, and route the known RK hotspot through the requested profile.
+## Why v1.4 is different
 
-The workflow also avoids `grep | head` while `pipefail` is enabled, performs patcher syntax checks before modifying source, verifies each behavior anchor exactly once, pins the exact upstream commits, and keeps profiles 1/2/3 independent.
+The previous static RK source assumed a particular `doubletake` internal API. The pinned v0.0.33 submodule can have different `MirrorSession` fields and heartbeat method signatures. v1.4 reads the exact pinned source during the GitHub run and generates an RK compatibility file that matches that API.
 
-## Successful result
+The AirPlay library also has two independent build paths:
+1. exact upstream `build.sh`;
+2. automatic deterministic fallback that reproduces the required Android/gomobile patches if the upstream script exits non-zero.
 
-The run should produce these artifacts:
+The workflow only fails if both AirPlay builders fail. In that case it automatically uploads full compiler/build logs and the exact generated source as `diagnostics-P1/P2/P3`; you do not have to manually copy hidden log lines.
 
-- `RK-Mirror-X40-P1`
-- `RK-Mirror-X40-P2`
-- `RK-Mirror-X40-P3`
+## Success
 
-Test P1 first. If a profile fails at runtime, power-cycle the RK-X40 before testing the next profile.
+When a profile is green, open that workflow run and download the `RK-Mirror-X40-P1` artifact first. It contains the APK and SHA-256 checksum.

@@ -1,14 +1,18 @@
 name: Build RK Mirror APKs
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: rk-mirror-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  # GitHub removed Node 20 from hosted runners in 2026. All actions below are
-  # Node-24-capable, and this also makes the runtime choice explicit.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
@@ -22,16 +26,14 @@ jobs:
         profile: [1, 2, 3]
 
     steps:
-      - name: Checkout this kit
+      - name: Checkout cloud kit
         uses: actions/checkout@v7
 
-      - name: Free non-Android runner disk space
+      - name: Free safe runner disk space
         shell: bash
         run: |
           set -euxo pipefail
           df -h
-          # Do NOT remove anything under the Android SDK. The previous workflow
-          # depended on the hosted runner's SDK, so keep it intact.
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/powershell || true
           df -h
 
@@ -47,143 +49,89 @@ jobs:
           go-version: '1.25.10'
           cache: false
 
-      - name: Locate and verify Android SDK
+      - name: Verify Android SDK and NDK
         shell: bash
         run: |
           set -euxo pipefail
-
-          # ubuntu-latest normally exports both variables, but do not assume a
-          # bare `sdkmanager` command is on PATH. That was the exact cause of
-          # the previous exit-code-127 failure.
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
           if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
             for candidate in /usr/local/lib/android/sdk "$HOME/Android/Sdk"; do
-              if [ -d "$candidate" ]; then
-                SDK_ROOT="$candidate"
-                break
-              fi
+              if [ -d "$candidate" ]; then SDK_ROOT="$candidate"; break; fi
             done
           fi
           test -n "$SDK_ROOT"
           test -d "$SDK_ROOT"
-
-          export ANDROID_HOME="$SDK_ROOT"
-          export ANDROID_SDK_ROOT="$SDK_ROOT"
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
-
-          echo "Android SDK root: $SDK_ROOT"
-          echo "Java: $(java -version 2>&1 | head -n 1)"
-          echo "Go: $(go version)"
-          command -v git
-          command -v python3
-          command -v bash
-          command -v realpath
-          command -v sed
-          command -v sha256sum
-
-          NDK_VERSION='27.0.12077973'
-          NEED_INSTALL=0
-          [ -d "$SDK_ROOT/platforms/android-36" ] || NEED_INSTALL=1
-          [ -d "$SDK_ROOT/build-tools/36.0.0" ] || NEED_INSTALL=1
-          [ -d "$SDK_ROOT/ndk/$NDK_VERSION" ] || NEED_INSTALL=1
-
-          if [ "$NEED_INSTALL" -eq 1 ]; then
-            SDKMANAGER=''
-
-            # Prefer the canonical stable location documented by Android.
-            if [ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
-              SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-            else
-              # GitHub images can carry a versioned cmdline-tools directory
-              # without a `latest` alias. Find the newest installed copy.
-              SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' -perm -111 2>/dev/null | sort -V | tail -n 1 || true)"
-            fi
-
-            if [ -n "$SDKMANAGER" ] && [ -x "$SDKMANAGER" ]; then
-              echo "Using sdkmanager: $SDKMANAGER"
-              set +o pipefail
-              yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true
-              set -o pipefail
-              "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
-                'platform-tools' \
-                'platforms;android-36' \
-                'build-tools;36.0.0' \
-                "ndk;$NDK_VERSION"
-            elif command -v android >/dev/null 2>&1; then
-              # Android CLI became the primary terminal interface in 2026.
-              # This fallback is only used if the legacy sdkmanager executable
-              # is genuinely absent.
-              echo "sdkmanager not found; using Android CLI fallback"
-              android --sdk="$SDK_ROOT" sdk install \
-                platforms/android-36 \
-                build-tools/36.0.0
-              # Most hosted images already contain the exact NDK. If not,
-              # print the package listing before failing rather than returning
-              # a misleading command-not-found error.
-              if [ ! -d "$SDK_ROOT/ndk/$NDK_VERSION" ]; then
-                android --sdk="$SDK_ROOT" sdk list 'ndk' --all-versions || true
-              fi
-            else
-              echo 'Neither sdkmanager nor the new Android CLI was found.' >&2
-              find "$SDK_ROOT/cmdline-tools" -maxdepth 4 -type f 2>/dev/null | sort | tail -n 100 || true
-            fi
+          NDK='27.0.12077973'
+          SDKMANAGER=''
+          if [ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' -perm -111 2>/dev/null | sort -V | tail -n 1 || true)"
           fi
-
-          # Hard gates: never move on to a 10+ minute build with a half-ready SDK.
+          if [ ! -d "$SDK_ROOT/platforms/android-36" ] || [ ! -d "$SDK_ROOT/build-tools/36.0.0" ] || [ ! -d "$SDK_ROOT/ndk/$NDK" ]; then
+            test -n "$SDKMANAGER"
+            set +o pipefail; yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true; set -o pipefail
+            "$SDKMANAGER" --sdk_root="$SDK_ROOT" 'platform-tools' 'platforms;android-36' 'build-tools;36.0.0' "ndk;$NDK"
+          fi
           test -d "$SDK_ROOT/platforms/android-36"
           test -d "$SDK_ROOT/build-tools/36.0.0"
-          test -d "$SDK_ROOT/ndk/$NDK_VERSION"
-          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
-          echo "Android SDK/NDK verification passed."
+          test -d "$SDK_ROOT/ndk/$NDK"
+          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/$NDK" >> "$GITHUB_ENV"
+          java -version
+          go version
           df -h
 
-      - name: Clone exact upstream release
+      - name: Clone exact upstream v0.0.33
         shell: bash
         run: |
           set -euxo pipefail
-          git clone --branch v0.0.33 --depth 1 --recurse-submodules \
-            https://github.com/jqssun/android-display-mirror.git src
-          cd src
-          test "$(git rev-parse HEAD)" = '6836ad7efe3e27b8db76422fdbc9b81b4973c16a'
-          test "$(git -C doubletake/doubletake rev-parse HEAD)" = '568a06ed32afa9fafdf229a798db0786f4d020f2'
-          git submodule status --recursive
+          git clone --branch v0.0.33 --depth 1 --recurse-submodules https://github.com/jqssun/android-display-mirror.git src
+          test "$(git -C src rev-parse HEAD)" = '6836ad7efe3e27b8db76422fdbc9b81b4973c16a'
+          test "$(git -C src/doubletake/doubletake rev-parse HEAD)" = '568a06ed32afa9fafdf229a798db0786f4d020f2'
 
-      - name: Apply RK-X40 compatibility profile
+      - name: Generate API-matched RK-X40 patch
         shell: bash
         run: |
           set -euxo pipefail
-          # Syntax-check the patcher before it can touch the cloned source.
-          python3 -m py_compile apply_patch.py
+          python3 -m py_compile generate_rkx40.py apply_patch.py tools/manual_prepare.py
           python3 apply_patch.py --repo src --profile '${{ matrix.profile }}'
+          test -s src/doubletake/rkx40.go
+          grep -n -m 3 'SetupMirrorRKX40' src/doubletake/rkx40.go
+          grep -n -m 3 'SetupMirrorRKX40' src/doubletake/airplaylib/airplaylib.go
+          grep -n -m 3 'rkx40.go' src/build.sh
+          gofmt -d src/doubletake/rkx40.go
 
-          # Avoid `grep | head` under pipefail (head can close the pipe early and
-          # turn an otherwise successful grep into SIGPIPE/exit 141).
-          grep -n -m 5 'SetupMirrorRKX40' src/doubletake/airplaylib/airplaylib.go
-          grep -n -m 5 'rkx40.go' src/build.sh
-          grep -n -m 5 '\[RKX40\]' src/doubletake/rkx40.go
-
-      - name: Preflight patched sources
+      - name: Build AirPlay AAR with automatic fallback
         shell: bash
         run: |
-          set -euxo pipefail
-          cd src
-          test -x ./build.sh
-          test -x ./gradlew
-          grep -q 'rkx40.go' build.sh
-          test "$(grep -c 'SetupMirrorRKX40' doubletake/airplaylib/airplaylib.go)" -eq 1
-          test -s doubletake/rkx40.go
-          # The upstream build script installs gomobile/gobind itself and adds
-          # GOPATH/bin to PATH. Show the relevant lines so a future failure is
-          # diagnosable directly from the Actions log.
-          grep -nE 'go install|GOPATH|gomobile bind|ANDROID_NDK' build.sh
+          set -u
+          PROFILE='${{ matrix.profile }}'
+          KIT="$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE/src"
+          rm -f "../airplay-upstream-P${PROFILE}.log" "../airplay-fallback-P${PROFILE}.log"
 
-      - name: Build AirPlay library
-        working-directory: src
-        shell: bash
-        run: |
-          set -euxo pipefail
-          ./build.sh
+          echo '=== Attempt 1: exact upstream build.sh ==='
+          set +e
+          bash -x ./build.sh 2>&1 | tee "../airplay-upstream-P${PROFILE}.log"
+          RC=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$RC" -ne 0 ] || [ ! -s app/libs/airplaylib.aar ]; then
+            echo "Upstream AirPlay builder exited $RC; switching automatically to deterministic fallback."
+            rm -f app/libs/airplaylib.aar
+            git -C doubletake/doubletake reset --hard '568a06ed32afa9fafdf229a798db0786f4d020f2'
+            git -C doubletake/doubletake clean -fdx
+            set +e
+            bash "$KIT/tools/manual_build_airplay.sh" "$GITHUB_WORKSPACE/src" "$KIT" "$PROFILE" 2>&1 | tee "../airplay-fallback-P${PROFILE}.log"
+            RC2=${PIPESTATUS[0]}
+            set -e
+            if [ "$RC2" -ne 0 ]; then
+              echo "Manual AirPlay fallback also failed (exit $RC2)."
+              exit "$RC2"
+            fi
+          fi
           test -s app/libs/airplaylib.aar
           ls -lh app/libs/airplaylib.aar
 
@@ -195,11 +143,12 @@ jobs:
           ./gradlew --no-daemon assembleDebug --stacktrace
           APK='app/build/outputs/apk/debug/app-debug.apk'
           test -s "$APK"
-          cp "$APK" "../RK-Mirror-X40-P${{ matrix.profile }}-debug.apk"
-          sha256sum "../RK-Mirror-X40-P${{ matrix.profile }}-debug.apk" > "../RK-Mirror-X40-P${{ matrix.profile }}-debug.apk.sha256"
-          ls -lh "../RK-Mirror-X40-P${{ matrix.profile }}-debug.apk"
+          OUT="../RK-Mirror-X40-P${{ matrix.profile }}-debug.apk"
+          cp "$APK" "$OUT"
+          sha256sum "$OUT" > "$OUT.sha256"
+          ls -lh "$OUT" "$OUT.sha256"
 
-      - name: Upload APK and checksum
+      - name: Upload APK
         uses: actions/upload-artifact@v6
         with:
           name: RK-Mirror-X40-P${{ matrix.profile }}
@@ -209,17 +158,21 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload failure diagnostics
+      - name: Upload diagnostics if anything fails
         if: failure()
         uses: actions/upload-artifact@v6
         with:
           name: diagnostics-P${{ matrix.profile }}
           path: |
+            airplay-upstream-P${{ matrix.profile }}.log
+            airplay-fallback-P${{ matrix.profile }}.log
             src/build.sh
-            src/doubletake/airplaylib/airplaylib.go
             src/doubletake/rkx40.go
+            src/doubletake/airplaylib/airplaylib.go
+            src/doubletake/doubletake/internal/airplay/rkx40.go
+            src/doubletake/doubletake/internal/airplay/mirror.go
+            src/doubletake/doubletake/internal/airplay/client.go
+            src/doubletake/doubletake/go.mod
             src/app/build/reports/**
-            src/app/build/outputs/logs/**
-            src/.gradle/**/fileHashes/**
           if-no-files-found: ignore
           retention-days: 7
