@@ -153,10 +153,15 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          python3 apply_patch.py --repo src --profile '${{ matrix.profile }}'
-          grep -R 'SetupMirrorRKX40' -n src/doubletake | head
-          grep -R 'RKX40' -n src/doubletake/airplaylib/airplaylib.go | head
+          # Syntax-check the patcher before it can touch the cloned source.
           python3 -m py_compile apply_patch.py
+          python3 apply_patch.py --repo src --profile '${{ matrix.profile }}'
+
+          # Avoid `grep | head` under pipefail (head can close the pipe early and
+          # turn an otherwise successful grep into SIGPIPE/exit 141).
+          grep -n -m 5 'SetupMirrorRKX40' src/doubletake/airplaylib/airplaylib.go
+          grep -n -m 5 'rkx40.go' src/build.sh
+          grep -n -m 5 '\[RKX40\]' src/doubletake/rkx40.go
 
       - name: Preflight patched sources
         shell: bash
@@ -166,7 +171,7 @@ jobs:
           test -x ./build.sh
           test -x ./gradlew
           grep -q 'rkx40.go' build.sh
-          grep -q 'SetupMirrorRKX40' doubletake/airplaylib/airplaylib.go
+          test "$(grep -c 'SetupMirrorRKX40' doubletake/airplaylib/airplaylib.go)" -eq 1
           test -s doubletake/rkx40.go
           # The upstream build script installs gomobile/gobind itself and adds
           # GOPATH/bin to PATH. Show the relevant lines so a future failure is
@@ -210,6 +215,9 @@ jobs:
         with:
           name: diagnostics-P${{ matrix.profile }}
           path: |
+            src/build.sh
+            src/doubletake/airplaylib/airplaylib.go
+            src/doubletake/rkx40.go
             src/app/build/reports/**
             src/app/build/outputs/logs/**
             src/.gradle/**/fileHashes/**

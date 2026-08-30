@@ -1,44 +1,27 @@
-# RK Mirror X40 — Cloud Build Kit v1.2
+# RK Mirror X40 — Cloud Build Kit v1.3
 
-This version is designed for the existing GitHub repository and avoids local Android build tooling completely.
+This kit updates the existing GitHub repository and builds the three RK-X40 compatibility APK profiles entirely on GitHub Actions. The Windows updater requires only Git (already installed). It does not require Python, Android Studio, an Android SDK/NDK, Gradle, Java, or Go locally for compilation.
 
-## Why v1.2 exists
-
-The first cloud workflow called `sdkmanager` as though it were guaranteed to be on the runner PATH. On the current GitHub-hosted image it was not, so all three matrix jobs stopped with exit code 127 before source compilation. v1.2 resolves the SDK root explicitly and calls the canonical `cmdline-tools/.../bin/sdkmanager` path. It also verifies API 36, Build Tools 36.0.0, and NDK 27.0.12077973 before cloning or compiling anything.
-
-The workflow now uses current Node-24-capable official GitHub actions (`checkout@v7`, `setup-java@v6`, `setup-go@v7`, `upload-artifact@v6`) to remove the Node 20/deprecation warnings shown by the previous run.
-
-## Existing repository: easiest route
+## Existing repository (recommended)
 
 1. Extract this ZIP.
 2. Double-click `UPDATE-EXISTING-REPO.bat`.
-3. Press Enter to use `https://github.com/Rafiu-Tahmid/rkmirror-x40.git`.
-4. Let it push the fixed workflow.
-5. GitHub should open automatically.
-6. Go to **Actions → Build RK Mirror APKs → Run workflow → Run workflow**.
+3. Press Enter to use the default repository `https://github.com/Rafiu-Tahmid/rkmirror-x40.git`.
+4. Wait for `SUCCESS`.
+5. In GitHub, open **Actions → Build RK Mirror APKs → Run workflow → Run workflow**.
 
-You do not need a new repository and do not need to install anything else on Windows.
+## What v1.3 fixes
 
-## What a healthy run looks like
+The v1.2 patcher tried to rename an Android string resource named `mirror_app_name`. The pinned upstream v0.0.33 source does not define that resource, so the patch step could exit before compilation. v1.3 removes all cosmetic app-name/version edits and patches only the three behavior-critical points: add `rkx40.go`, link it into the nested AirPlay build, and route the known RK hotspot through the requested profile.
 
-Each Profile job should pass these gates in order:
+The workflow also avoids `grep | head` while `pipefail` is enabled, performs patcher syntax checks before modifying source, verifies each behavior anchor exactly once, pins the exact upstream commits, and keeps profiles 1/2/3 independent.
 
-1. `Locate and verify Android SDK` → ends with `Android SDK/NDK verification passed.`
-2. `Clone exact upstream release`
-3. `Apply RK-X40 compatibility profile`
-4. `Preflight patched sources`
-5. `Build AirPlay library`
-6. `Build Android APK`
-7. `Upload APK and checksum`
+## Successful result
 
-When finished, the run's **Artifacts** section should contain:
+The run should produce these artifacts:
 
 - `RK-Mirror-X40-P1`
 - `RK-Mirror-X40-P2`
 - `RK-Mirror-X40-P3`
 
-Test P1 first.
-
-## If a source-level failure still appears
-
-Do not rerun repeatedly. Open the failed job and send the first failing step's final 30–50 lines. At that point the failure is no longer a Windows installer/SDK-discovery problem; the workflow's preflight gates make the failing layer explicit.
+Test P1 first. If a profile fails at runtime, power-cycle the RK-X40 before testing the next profile.

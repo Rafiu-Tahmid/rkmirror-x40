@@ -1,91 +1,106 @@
 from pathlib import Path
-import argparse, re, sys
+import argparse
 
-p = argparse.ArgumentParser()
-p.add_argument('--repo', required=True)
-p.add_argument('--profile', type=int, choices=[1,2,3], required=True)
-a = p.parse_args()
-root = Path(a.repo).resolve()
-profile = a.profile
+parser = argparse.ArgumentParser(description="Apply the narrow RK-X40 compatibility patch")
+parser.add_argument("--repo", required=True)
+parser.add_argument("--profile", type=int, choices=(1, 2, 3), required=True)
+args = parser.parse_args()
 
-def read(path):
-    return Path(path).read_text(encoding='utf-8-sig').replace('\r\n','\n')
+root = Path(args.repo).resolve()
+profile = args.profile
+kit_root = Path(__file__).resolve().parent
 
-def write(path, text):
-    Path(path).write_text(text, encoding='utf-8', newline='\n')
 
-def replace_required(path, old, new, label):
-    text = read(path)
-    if old not in text:
-        raise RuntimeError(f'Patch anchor missing for {label}: {path}')
-    write(path, text.replace(old, new, 1))
-    print(f'patched: {label}')
+def read_text(path: Path) -> str:
+    # utf-8-sig safely consumes a BOM if a checkout/editor ever introduced one.
+    return path.read_text(encoding="utf-8-sig").replace("\r\n", "\n")
 
-print(f'Applying RK-X40 profile {profile} to {root}')
-# Custom source used by patched upstream build.sh
-src = Path(__file__).resolve().parent / 'patches' / 'rkx40.go'
-dst = root / 'doubletake' / 'rkx40.go'
-dst.write_bytes(src.read_bytes())
 
-build = root / 'build.sh'
-replace_required(
+def write_text(path: Path, text: str) -> None:
+    # Explicit UTF-8 + LF keeps generated source deterministic on every runner.
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def replace_once(path: Path, old: str, new: str, label: str) -> None:
+    text = read_text(path)
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(
+            f"Patch anchor for {label!r} must occur exactly once, found {count}: {path}"
+        )
+    write_text(path, text.replace(old, new, 1))
+    print(f"patched: {label}")
+
+
+print(f"Applying RK-X40 profile {profile} to {root}")
+
+# 1) Add only our AirPlay compatibility source. Do not edit cosmetic Android
+# resources/version metadata; those were unnecessary and made the patch brittle.
+src = kit_root / "patches" / "rkx40.go"
+dst = root / "doubletake" / "rkx40.go"
+if not src.is_file() or src.stat().st_size == 0:
+    raise RuntimeError(f"RK compatibility source missing/empty: {src}")
+write_text(dst, read_text(src))
+print("copied: RK-X40 compatibility source")
+
+# 2) Make upstream build.sh expose rkx40.go inside the pinned nested doubletake
+# tree when it creates its temporary build workspace.
+build = root / "build.sh"
+replace_once(
     build,
-    'ln -sf ../../../airplay1.go internal/airplay/airplay1.go',
-    'ln -sf ../../../airplay1.go internal/airplay/airplay1.go\nln -sf ../../../rkx40.go internal/airplay/rkx40.go',
-    'build.sh RK source link')
+    "ln -sf ../../../airplay1.go internal/airplay/airplay1.go",
+    "ln -sf ../../../airplay1.go internal/airplay/airplay1.go\n"
+    "ln -sf ../../../rkx40.go internal/airplay/rkx40.go",
+    "build.sh RK source link",
+)
 
-# The cloud workflow verifies/installs the exact NDK before build.sh runs. Avoid
-# asking sdkmanager to install the same NDK a second time on every profile.
-replace_required(
-    build,
-    'if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then\n"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${ANDROID_NDK_VERSION}"\nfi',
-    'if [ ! -d "$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" ] && [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then\n"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${ANDROID_NDK_VERSION}"\nfi',
-    'build.sh idempotent NDK install')
+# 3) Keep receiver detection deliberately narrow: only the RK direct hotspot
+# address observed on this hardware, and only while the app's legacy mode is off.
+airplaylib = root / "doubletake" / "airplaylib" / "airplaylib.go"
+replace_once(
+    airplaylib,
+    "\t\t// match the receiver's display; airplay1 keeps caller dims + clamp\n"
+    "\t\tif airplay.AirPlay1Mode {",
+    "\t\t// RK-X40L Ultra direct hotspot observed on this hardware.\n"
+    "\t\t// Keep this deliberately narrow so all other receivers stay stock.\n"
+    "\t\trkCompat := !airplay.AirPlay1Mode && host == \"192.168.68.1\" && port == 5000\n"
+    "\t\tif rkCompat {\n"
+    "\t\t\ts.logf(\"[RKX40] detected direct hotspot receiver at %s:%d; enabling video-only compatibility path\", host, port)\n"
+    "\t\t}\n\n"
+    "\t\t// match the receiver's display; airplay1 keeps caller dims + clamp\n"
+    "\t\tif airplay.AirPlay1Mode {",
+    "airplaylib RK detection",
+)
 
-ap = root / 'doubletake' / 'airplaylib' / 'airplaylib.go'
-replace_required(
-    ap,
-    '\t\t// match the receiver\'s display; airplay1 keeps caller dims + clamp\n\t\tif airplay.AirPlay1Mode {',
-    '\t\t// RK-X40L Ultra direct hotspot observed on this hardware.\n'
-    '\t\t// Keep this deliberately narrow so all other receivers stay stock.\n'
-    '\t\trkCompat := !airplay.AirPlay1Mode && host == "192.168.68.1" && port == 5000\n'
-    '\t\tif rkCompat {\n'
-    '\t\t\ts.logf("[RKX40] detected direct hotspot receiver at %s:%d; enabling video-only compatibility path", host, port)\n'
-    '\t\t}\n\n'
-    '\t\t// match the receiver\'s display; airplay1 keeps caller dims + clamp\n'
-    '\t\tif airplay.AirPlay1Mode {',
-    'airplaylib RK detection')
+stock_setup = (
+    "\t\tif airplay.AirPlay1Mode {\n"
+    "\t\t\tmirror, setupErr = client.SetupMirrorAirPlay1(ctx)\n"
+    "\t\t} else {\n"
+    "\t\t\tmirror, setupErr = client.SetupMirror(ctx, airplay.StreamConfig{FPS: fps})\n"
+    "\t\t}"
+)
+rk_setup = (
+    "\t\tif airplay.AirPlay1Mode {\n"
+    "\t\t\tmirror, setupErr = client.SetupMirrorAirPlay1(ctx)\n"
+    "\t\t} else if rkCompat {\n"
+    f"\t\t\tmirror, setupErr = client.SetupMirrorRKX40(ctx, airplay.StreamConfig{{FPS: fps, NoAudio: true}}, {profile})\n"
+    "\t\t} else {\n"
+    "\t\t\tmirror, setupErr = client.SetupMirror(ctx, airplay.StreamConfig{FPS: fps})\n"
+    "\t\t}"
+)
+replace_once(airplaylib, stock_setup, rk_setup, "airplaylib RK routing")
 
-old = ('\t\tif airplay.AirPlay1Mode {\n'
-       '\t\t\tmirror, setupErr = client.SetupMirrorAirPlay1(ctx)\n'
-       '\t\t} else {\n'
-       '\t\t\tmirror, setupErr = client.SetupMirror(ctx, airplay.StreamConfig{FPS: fps})\n'
-       '\t\t}')
-new = ('\t\tif airplay.AirPlay1Mode {\n'
-       '\t\t\tmirror, setupErr = client.SetupMirrorAirPlay1(ctx)\n'
-       '\t\t} else if rkCompat {\n'
-       f'\t\t\tmirror, setupErr = client.SetupMirrorRKX40(ctx, airplay.StreamConfig{{FPS: fps, NoAudio: true}}, {profile})\n'
-       '\t\t} else {\n'
-       '\t\t\tmirror, setupErr = client.SetupMirror(ctx, airplay.StreamConfig{FPS: fps})\n'
-       '\t\t}')
-replace_required(ap, old, new, 'airplaylib RK routing')
+# 4) Hard post-patch assertions. These are intentionally about behavior only,
+# not labels/version strings, so upstream UI-resource layout cannot break us.
+build_text = read_text(build)
+airplay_text = read_text(airplaylib)
+rk_text = read_text(dst)
 
-strings = root / 'app' / 'src' / 'main' / 'res' / 'values' / 'strings.xml'
-text = read(strings)
-newtext, n = re.subn(r'<string name="mirror_app_name">[^<]*</string>', f'<string name="mirror_app_name">RK Mirror X40 P{profile}</string>', text, count=1)
-if n != 1:
-    raise RuntimeError('App-name patch anchor missing')
-write(strings, newtext)
+assert build_text.count("internal/airplay/rkx40.go") == 1
+assert airplay_text.count("rkCompat :=") == 1
+assert airplay_text.count("SetupMirrorRKX40") == 1
+assert f"}}, {profile})" in airplay_text
+assert "func (c *AirPlayClient) SetupMirrorRKX40" in rk_text
+assert "[RKX40]" in rk_text
 
-gradle = root / 'app' / 'build.gradle'
-text = read(gradle)
-newtext, n = re.subn(r'versionName\s+"[^"]+"', f'versionName "0.0.33-rkx40.p{profile}"', text, count=1)
-if n != 1:
-    raise RuntimeError('versionName patch anchor missing')
-write(gradle, newtext)
-
-# Sanity checks before expensive build.
-for f in [build, ap, strings, gradle, dst]:
-    if not f.exists() or f.stat().st_size == 0:
-        raise RuntimeError(f'Patched file missing/empty: {f}')
-print('Patch completed and sanity-checked.')
+print(f"RK-X40 profile {profile} patch completed and behavior assertions passed.")
